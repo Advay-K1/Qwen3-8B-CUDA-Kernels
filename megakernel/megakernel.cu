@@ -102,16 +102,17 @@ QK_DEVICE void row_dot(const bf16* __restrict__ w, const bf16* sx, float* acc, u
   for (int b = 0; b < NB; ++b) acc[b] = warp_sum(acc[b]);
 }
 
-// Rows [0, N) pulled dynamically by all warps of the grid. body(row) does the work.
+// Rows [0, N): warp i of the grid takes row i statically (no burst of same-address
+// atomics at stage start), then pulls rows >= #warps from the stage's atomic counter
+// (fetched one row ahead, so the atomic's latency hides behind the row's stream).
 template <class Body>
 QK_DEVICE void for_rows(unsigned* ctr, int N, Body body) {
   const int lane = threadIdx.x & 31;
-  unsigned row = 0;
-  if (lane == 0) row = atomicAdd(ctr, 1u);
-  row = __shfl_sync(0xffffffff, row, 0);
+  const unsigned nwarps = gridDim.x * WARPS;
+  unsigned row = blockIdx.x * WARPS + (threadIdx.x >> 5);
   while (row < (unsigned)N) {
     unsigned nxt = 0;
-    if (lane == 0) nxt = atomicAdd(ctr, 1u);  // in flight while this row streams
+    if (lane == 0) nxt = nwarps + atomicAdd(ctr, 1u);
     body((int)row);
     row = __shfl_sync(0xffffffff, nxt, 0);
   }
