@@ -28,7 +28,7 @@ constexpr int H = 4096, I = 12288, HQ = 32, HKV = 8, D = 128, NREP = HQ / HKV, Q
 constexpr int THREADS = MK_THREADS, WARPS = THREADS / 32;
 constexpr int SUB = 64;  // keys per attention sub-chunk
 constexpr int KV_STAGES = 3;
-constexpr int CTRS_PER_LAYER = 8;
+constexpr int CTRS_PER_LAYER = 8 + 4 * HKV;  // 4 GEMV row counters (+pad) + per-(b, kv head) split counters
 
 // ------------------------------------------------------------------ memory helpers
 QK_DEVICE uint64_t evict_first_policy() {
@@ -179,6 +179,7 @@ struct AttnSmem {
   float q[2 * NREP][QP];  // row = head*2 + half (64 floats each), padded: conflict-free per-thread reads
   float s[NREP][SUB];   // scores, then probabilities
   float m[NREP], l[NREP], a[NREP];
+  int last;
 };
 
 // cp.async `nrows` K and V rows (global rows base..) into stage `st`; skips global row `skip`.
@@ -391,6 +392,29 @@ QK_DEVICE void attn_item(const MegaParams& p, const LayerW& L, int layer, int it
       pp[D] = sm.m[o_head];
       pp[D + 1] = sm.l[o_head];
     }
+    __threadfence();
+  }
+  __syncthreads();
+  // Last split to finish for this (sequence, KV head) combines all splits of its 4 heads.
+  if (tid == 0) {
+    unsigned* cnt = p.bar + 1 + layer * CTRS_PER_LAYER + 8 + b * HKV + hk;
+    sm.last = (atomicAdd(cnt, 1u) == (unsigned)p.nsplit - 1);
+  }
+  __syncthreads();
+  if (sm.last) {
+    __threadfence();
+    const int h = tid >> 7, d = tid & (D - 1);
+    const float* base = p.attn_part + ((size_t)b * HQ + hk * NREP + h) * p.nsplit * PST;
+    float M = -INFINITY;
+    for (int s2 = 0; s2 < p.nsplit; ++s2) M = fmaxf(M, __ldcg(base + s2 * PST + D));
+    float num = 0.f, den = 0.f;
+    for (int s2 = 0; s2 < p.nsplit; ++s2) {
+      const float ms = __ldcg(base + s2 * PST + D);
+      const float a = (ms == -INFINITY) ? 0.f : ex2(ms - M);
+      num = fmaf(a, __ldcg(base + s2 * PST + d), num);
+      den = fmaf(a, __ldcg(base + s2 * PST + D + 1), den);
+    }
+    p.attn_out[((size_t)b * HQ + hk * NREP + h) * D + d] = __float2bfloat16(den > 0.f ? num / den : 0.f);
   }
   __syncthreads();
   if (p.timing && layer == 0 && item == blockIdx.x && blockIdx.x == 0 && threadIdx.x == 0) p.timing[255] = gtimer();
@@ -543,8 +567,8 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
     grid_sync(p.bar, target, p.timing ? p.timing + 512 + (size_t)tick * gridDim.x : nullptr);
     stamp();
 
-    // S3: combine + O projection + residual
-    load_attn_combined<NB>(p, sx, swt);
+    // S3: O projection + residual (attention output was combined by the last split of each head group)
+    load_vec<NB>(p.attn_out, H, sx);
     for_rows(ctr + 1, H, [&](int row) {
       float acc[NB];
       row_dot<NB, H>(L.o + (size_t)row * H, sx, acc, pol);

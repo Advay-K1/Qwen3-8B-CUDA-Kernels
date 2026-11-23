@@ -43,7 +43,7 @@ class MegaDecoder:
         self.attn = torch.empty(B, c.n_heads * c.head_dim, **bf)
         self.h = torch.empty(B, c.intermediate, **bf)
         self.logits = torch.empty(B, c.vocab if self.lm_head is not None else 1, **f32)
-        self.bar = torch.zeros(1 + 8 * (self.n_layers + 1), device=dev, dtype=torch.int32)
+        self.bar = torch.zeros(m.counter_words(self.n_layers), device=dev, dtype=torch.int32)
         self._dummy = torch.zeros(8, **bf)
 
     def _schedule(self, pos):

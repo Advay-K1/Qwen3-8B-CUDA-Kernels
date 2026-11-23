@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 from qwen3_kernels import Qwen3Model  # noqa: E402
 from qwen3_kernels.megakernel import MegaDecoder  # noqa: E402
 
-STAGES = ["qkv", "attn", "comb+o_proj", "gate_up", "down"]
+STAGES = ["qkv", "attn", "o_proj", "gate_up", "down"]
 NS = len(STAGES)
 
 
@@ -38,7 +38,7 @@ def main():
     m = Qwen3Model.from_pretrained(os.environ["QWEN3_PATH"])
     c = m.cfg
     B = a.batch
-    wbytes = {"qkv": c.qkv_dim * 4096 * 2, "attn": 0, "comb+o_proj": 4096 * 4096 * 2,
+    wbytes = {"qkv": c.qkv_dim * 4096 * 2, "attn": 0, "o_proj": 4096 * 4096 * 2,
               "gate_up": 2 * 12288 * 4096 * 2, "down": 4096 * 12288 * 2}
     print(f"achievable HBM read bandwidth (torch sum): {bw:.0f} GB/s")
     for ctx in a.ctx:

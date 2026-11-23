@@ -79,4 +79,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("pack_layers", &pack_layers);
   m.def("max_grid", &max_grid);
   m.def("decode_step", &decode_step);
+  m.def("counter_words", [](int64_t n) { return (int64_t)mk::counter_words(n); });
 }
