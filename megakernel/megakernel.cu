@@ -624,7 +624,11 @@ template <int NB>
 cudaError_t launch_nb(const MegaParams& p, int grid, cudaStream_t st) {
   auto k = decode_megakernel<NB>;
   constexpr size_t smem = SmemLayout<NB>::TOTAL;
-  cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+  static bool configured = false;  // attribute calls are not free; do it once per instantiation
+  if (!configured) {
+    cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    configured = true;
+  }
   MegaParams pp = p;
   void* args[] = {&pp};
   return cudaLaunchCooperativeKernel((void*)k, dim3(grid), dim3(THREADS), args, smem, st);
