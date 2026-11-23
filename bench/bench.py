@@ -137,7 +137,7 @@ def decode_bench(ctx=512, n_tokens=64, B=1):
     nbytes = sum(p.numel() * 2 for p in m.parameters()) - m.embed.numel() * 2 + B * c.hidden * 2
     nbytes += L * 2 * B * c.n_kv_heads * (ctx + 1) * 128 * 2
     for name, t in [("layered kernels", t_l), ("layered + CUDA graph", t_g), ("megakernel", t_m)]:
-        print(f"  {name:22s} {t:7.3f} ms/token  {B * 1e3 / t:7.1f} tok/s  {nbytes / t / 1e6:7.1f} GB/s effective")
+        print(f"  {name:26s} {t:7.3f} ms/token  {B * 1e3 / t:7.1f} tok/s  {nbytes / t / 1e6:7.1f} GB/s effective")
 
 
 if __name__ == "__main__":

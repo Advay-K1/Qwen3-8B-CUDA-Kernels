@@ -35,6 +35,8 @@ struct MegaParams {
   bf16* h;                // [B, I]
   float* logits;          // [B, V]
   unsigned* bar;          // grid barrier counter (zeroed before launch)
+  int prefetch;           // bit0: L2-prefetch O-proj slice during attention; bit1: next-stage rows before barriers.
+                          // Measured slower on A100 (L2 contention with the streaming GEMVs); off by default.
 };
 
 cudaError_t launch(const MegaParams& p, int grid, cudaStream_t st);

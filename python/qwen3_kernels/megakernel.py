@@ -12,7 +12,8 @@ class MegaDecoder:
     k_cache / v_cache: [n_layers, B, Hkv, Smax, D] bf16 (shared with the prefill path).
     """
 
-    def __init__(self, model, B, Smax, k_cache, v_cache, layers=None, with_head=True):
+    def __init__(self, model, B, Smax, k_cache, v_cache, layers=None, with_head=True, prefetch=0):
+        self.prefetch = prefetch
         m = mega()
         c = model.cfg
         assert (c.hidden, c.intermediate, c.n_heads, c.n_kv_heads, c.head_dim) == (4096, 12288, 32, 8, 128)
@@ -58,7 +59,7 @@ class MegaDecoder:
                            self.final_norm if self.final_norm is not None else self._dummy,
                            self.lm_head if with_head else None, self.kc, self.vc, pos, nsplit, chunk, c.eps,
                            c.rope_theta, self.x, self.qkv, self.part, self.attn, self.h, self.logits, self.bar,
-                           self.grid)
+                           self.grid, self.prefetch)
 
     @torch.no_grad()
     def step(self, tokens, pos):

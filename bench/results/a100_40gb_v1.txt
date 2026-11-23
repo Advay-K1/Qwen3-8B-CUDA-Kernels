@@ -14,3 +14,13 @@ NVIDIA A100-SXM4-40GB, torch 2.12 / CUDA 13.2, commit after "Fix optional-tensor
   layered kernels         13.432 ms/token     74.4 tok/s   1132.5 GB/s effective
   layered + CUDA graph    12.926 ms/token     77.4 tok/s   1176.9 GB/s effective
   megakernel              12.120 ms/token     82.5 tok/s   1255.2 GB/s effective
+
+--- after optimizations (GEMM 128x256 tiles, flash bwd 8 warps / 128-key blocks) ---
+GEMM T=4096 TFLOP/s (ours | cuBLAS): qkv fwd 187|253 dx 192|264 dW 176|250; o_proj fwd 185|254; gate_up fwd 200|256 dx 198|259 dW 196|264; down fwd 197|259 dx 188|256 dW 189|261
+Flash attention S=4096: fwd 1.07 ms (SDPA 0.84); bwd 4.08 ms (SDPA 2.50), was 5.26
+Decode megakernel, ms/token (L2 prefetch variants pf=0 none / 1 O-proj during attn / 2 barrier heads / 3 both):
+B=1 ctx=512  pf=0: 12.179  pf=1: 12.253  pf=2: 12.213  pf=3: 12.360
+B=1 ctx=4096 pf=0: 12.413  pf=1: 12.595  pf=2: 12.469  pf=3: 12.605
+B=4 ctx=512  pf=0: 13.069  pf=1: 13.388  pf=2: 13.233  pf=3: 13.463
+B=4 ctx=4096 pf=0: 15.254  pf=1: 15.812  pf=2: 15.384  pf=3: 15.916
+B=4 ctx=512: layered 15.65, layered+graph 15.17, megakernel 13.13 ms/token (304.6 tok/s)

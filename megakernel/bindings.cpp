@@ -32,7 +32,7 @@ int64_t max_grid(int64_t B) {
 void decode_step(const Tensor& layers, int64_t n_layers, const c10::optional<Tensor>& tokens, const Tensor& embed,
                  const Tensor& final_norm, const c10::optional<Tensor>& lm_head, Tensor& k_cache, Tensor& v_cache,
                  int64_t pos, int64_t nsplit, int64_t chunk, double eps, double theta, Tensor& x, Tensor& qkv,
-                 Tensor& attn_part, Tensor& attn_out, Tensor& h, Tensor& logits, Tensor& bar, int64_t grid) {
+                 Tensor& attn_part, Tensor& attn_out, Tensor& h, Tensor& logits, Tensor& bar, int64_t grid, int64_t prefetch) {
   const c10::cuda::CUDAGuard g(x.device());
   TORCH_CHECK(k_cache.dim() == 5 && k_cache.size(0) >= n_layers, "k_cache must be [L, B, Hkv, Smax, D]");
   TORCH_CHECK(pos < k_cache.size(3), "cache full");
@@ -62,6 +62,7 @@ void decode_step(const Tensor& layers, int64_t n_layers, const c10::optional<Ten
   p.attn_out = bp(attn_out);
   p.h = bp(h);
   p.logits = logits.data_ptr<float>();
+  p.prefetch = prefetch;
   p.bar = reinterpret_cast<unsigned*>(bar.data_ptr<int32_t>());
   auto st = at::cuda::getCurrentCUDAStream();
   cudaMemsetAsync(p.bar, 0, sizeof(unsigned), st);

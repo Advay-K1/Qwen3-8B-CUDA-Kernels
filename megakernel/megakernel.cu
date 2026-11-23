@@ -44,6 +44,13 @@ QK_DEVICE float2 ld_cg_bf2(const bf16* p) {
   return __bfloat1622float2(*reinterpret_cast<bf162*>(&u));
 }
 
+// Pull `bytes` starting at p into L2 (no registers / smem consumed).
+QK_DEVICE void prefetch_l2(const void* p, size_t bytes) {
+  const char* c = reinterpret_cast<const char*>(p);
+  for (size_t off = (size_t)threadIdx.x * 128; off < bytes; off += (size_t)THREADS * 128)
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(c + off));
+}
+
 QK_DEVICE void grid_sync(unsigned* bar, unsigned& target) {
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -63,6 +70,14 @@ QK_DEVICE void rows_of(int N, int& r0, int& r1) {
   int per = (N + gridDim.x - 1) / gridDim.x;
   r0 = min(N, (int)blockIdx.x * per);
   r1 = min(N, r0 + per);
+}
+
+// Prefetch the first `rows` rows of this CTA's slice of an [N, K] weight.
+QK_DEVICE void prefetch_slice(const bf16* W, int N, int K, int rows) {
+  int r0, r1;
+  rows_of(N, r0, r1);
+  int n = min(rows, r1 - r0);
+  if (n > 0) prefetch_l2(W + (size_t)r0 * K, (size_t)n * K * 2);
 }
 
 // ------------------------------------------------------------------ GEMV building blocks
@@ -359,6 +374,8 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
     grid_sync(p.bar, target);
 
     // S2: attention partials (+ q/k norm, rope, cache append)
+    // HBM is mostly idle in S2/S3: stream this CTA's whole O-proj slice into L2 meanwhile.
+    if (p.prefetch & 1) prefetch_slice(L.o, H, H, H);
     for (int item = blockIdx.x; item < NB * HKV * p.nsplit; item += gridDim.x) attn_item<NB>(p, L, layer, item, sa);
     grid_sync(p.bar, target);
 
@@ -374,6 +391,10 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
       bf16* xp = x + (size_t)b * H + row;
       *xp = __float2bfloat16(v + __bfloat162float(__ldcg(xp)));
     });
+    if (p.prefetch & 2) {  // cover the barrier with the head of the next stage's weights
+      prefetch_slice(L.gate_up, I, H, 8);
+      prefetch_slice(L.gate_up + (size_t)I * H, I, H, 8);
+    }
     grid_sync(p.bar, target);
 
     // S5: post norm + gate/up + SwiGLU
@@ -389,6 +410,7 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
         p.h[(size_t)b * I + row] = __float2bfloat16(bf16_round(g * sigmoidf_(g)) * u);
       });
     }
+    if (p.prefetch & 2) prefetch_slice(L.down, H, I, 4);
     grid_sync(p.bar, target);
 
     // S6: down projection + residual
@@ -398,6 +420,10 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
       bf16* xp = x + (size_t)b * H + row;
       *xp = __float2bfloat16(v + __bfloat162float(__ldcg(xp)));
     });
+    if (p.prefetch & 2) {
+      if (layer + 1 < p.n_layers) prefetch_slice(p.layers[layer + 1].qkv, QKV, H, 16);
+      else if (p.lm_head) prefetch_slice(p.lm_head, p.vocab, H, 16);
+    }
     grid_sync(p.bar, target);
   }
 
