@@ -55,3 +55,29 @@ m = Qwen3Model.from_pretrained(path)
 loss = m(ids, targets); loss.backward()                         # training step on custom kernels
 out = m.generate(ids, 64, temperature=0.7, top_p=0.9, use_megakernel=True)
 ```
+
+## Status / results (A100-SXM4-40GB)
+
+Correctness: `tests/test_ops.py` 79/79, `tests/test_model.py` 34/34. The model tests compare against HF transformers on the real weights:
+- every layer's fwd output and all of its weight grads
+- 2-layer training loss and grads
+- full-model prefill logits: cosine 0.99997, 100% top-1 agreement
+- greedy generation: identical until a bf16 near-tie where HF's own logits are tied
+
+The megakernel reproduces the layer-by-layer decode path token for token.
+
+| | ours | reference |
+|---|---|---|
+| GEMM, Qwen3 shapes, T=4096 | 176–200 TFLOP/s | cuBLAS 250–264 |
+| Flash-attn fwd, S=4096, causal GQA | 1.07 ms | SDPA 0.84 ms |
+| Flash-attn bwd | 4.08 ms | SDPA 2.50 ms |
+| Decoder layer fwd+bwd, S=4096 | 35.6 ms (145 TFLOP/s) | – |
+| Decode B=1, ctx 512: layered / +CUDA graph / **megakernel** | 13.44 / 12.94 / **12.19 ms/token** (82 tok/s, ~1.25 TB/s ≈ 80% of HBM peak) | – |
+| Decode B=4, ctx 512: layered+graph / **megakernel** | 15.17 / **13.13 ms/token** (305 tok/s) | – |
+
+Full logs are in `bench/results/`.
+
+Possible next steps:
+- flash-attn bwd: get rid of register spills and the dQ atomics, e.g. with a separate dQ pass
+- GEMM: double-buffer fragments in registers and stage the epilogue through shared memory
+- Hopper-specific paths (wgmma/TMA) for the H200 nodes
