@@ -437,11 +437,13 @@ void flash_attn_fwd(const bf16* q, const bf16* k, const bf16* v, bf16* o, float*
                     int kv_S, float scale, cudaStream_t st) {
   constexpr int smem = 4 * TILE * 2;
   if (g_fwd_warps == 8) {
-    cudaFuncSetAttribute(flash_fwd_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    static bool cfg = false;
+    if (!cfg) { cudaFuncSetAttribute(flash_fwd_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); cfg = true; }
     dim3 grid((S + 127) / 128, Hq, B);
     flash_fwd_kernel<8><<<grid, 256, smem, st>>>(q, k, v, o, lse, S, Hq, Hkv, kv_S, scale * LOG2E);
   } else {
-    cudaFuncSetAttribute(flash_fwd_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    static bool cfg = false;
+    if (!cfg) { cudaFuncSetAttribute(flash_fwd_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); cfg = true; }
     dim3 grid((S + 63) / 64, Hq, B);
     flash_fwd_kernel<4><<<grid, 128, smem, st>>>(q, k, v, o, lse, S, Hq, Hkv, kv_S, scale * LOG2E);
   }
@@ -456,12 +458,14 @@ void flash_attn_bwd(const bf16* q, const bf16* k, const bf16* v, const bf16* o, 
   flash_bwd_pre_kernel<<<(rows + 7) / 8, 256, 0, st>>>(dout, o, dvec, B, S, Hq);
   if (g_bwd_warps == 4) {
     constexpr int smem = bwd_smem<4>();
-    cudaFuncSetAttribute(flash_bwd_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    static bool cfg = false;
+    if (!cfg) { cudaFuncSetAttribute(flash_bwd_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); cfg = true; }
     dim3 grid((S + 63) / 64, Hkv, B);
     flash_bwd_kernel<4><<<grid, 128, smem, st>>>(q, k, v, dout, lse, dvec, dq_acc, dk, dv, S, Hq, Hkv, scale);
   } else {
     constexpr int smem = bwd_smem<8>();
-    cudaFuncSetAttribute(flash_bwd_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    static bool cfg = false;
+    if (!cfg) { cudaFuncSetAttribute(flash_bwd_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); cfg = true; }
     dim3 grid((S + 127) / 128, Hkv, B);
     flash_bwd_kernel<8><<<grid, 256, smem, st>>>(q, k, v, dout, lse, dvec, dq_acc, dk, dv, S, Hq, Hkv, scale);
   }
