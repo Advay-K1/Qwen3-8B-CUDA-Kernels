@@ -225,7 +225,7 @@ __global__ void __launch_bounds__(NWB * 32)
 flash_bwd_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ V,
                  const bf16* __restrict__ dO, const float* __restrict__ LSE, const float* __restrict__ Dvec,
                  float* __restrict__ dQacc, bf16* __restrict__ dK, bf16* __restrict__ dV, int S, int Hq, int Hkv,
-                 float scale) {
+                 float scale, int dbg) {
   constexpr int BCB = 16 * NWB, NT = NWB * 32;
   extern __shared__ __align__(128) uint8_t smem_raw[];
   bf16* sK = reinterpret_cast<bf16*>(smem_raw);
@@ -399,15 +399,28 @@ flash_bwd_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K, const b
           mma_bf16_16816(dq[2 * p + 1], af, bb + 2);
         }
       }
+      // Sector-friendly atomics: lanes g and g^4 swap their odd-column values so each RED
+      // instruction covers 4 full rows x 8 contiguous floats (4 sectors) instead of
+      // 8 rows x 4 strided floats (8 half-used sectors).
+      if (!(dbg & 1)) {
+        const bool lo4 = g < 4;
 #pragma unroll
-      for (int hh = 0; hh < 2; ++hh) {
-        int q = q0 + rg * 16 + g + hh * 8;
-        if (q >= S) continue;
-        float* dst = dQacc + ((size_t)(b * Hq + hq) * S + q) * D + half * 64 + 2 * t;
+        for (int hh = 0; hh < 2; ++hh) {
+          const int rbase = q0 + rg * 16 + hh * 8;  // 8-row group
+          const int rA = lo4 ? g : g - 4;           // instruction A: rows 0..3 of the group
+          const int rB = lo4 ? g + 4 : g;           // instruction B: rows 4..7
+          const int cA = lo4 ? 2 * t : 2 * t + 1;
+          const int cB = lo4 ? 2 * t + 1 : 2 * t;
+          float* rowA = dQacc + ((size_t)(b * Hq + hq) * S + rbase + rA) * D + half * 64 + cA;
+          float* rowB = dQacc + ((size_t)(b * Hq + hq) * S + rbase + rB) * D + half * 64 + cB;
+          const bool okA = rbase + rA < S, okB = rbase + rB < S;
 #pragma unroll
-        for (int n = 0; n < 8; ++n) {
-          atomicAdd(dst + n * 8, dq[n][2 * hh] * scale);
-          atomicAdd(dst + n * 8 + 1, dq[n][2 * hh + 1] * scale);
+          for (int n = 0; n < 8; ++n) {
+            const float v0 = dq[n][2 * hh] * scale, v1 = dq[n][2 * hh + 1] * scale;
+            const float other = __shfl_xor_sync(0xffffffff, v1, 16);
+            if (okA) atomicAdd(rowA + n * 8, lo4 ? v0 : other);
+            if (okB) atomicAdd(rowB + n * 8, lo4 ? other : v0);
+          }
         }
       }
     }
@@ -450,6 +463,8 @@ void flash_attn_fwd(const bf16* q, const bf16* k, const bf16* v, bf16* o, float*
 }
 
 static int g_bwd_warps = 8;
+static int g_bwd_dbg = 0;
+void flash_bwd_set_debug(int f) { g_bwd_dbg = f; }
 
 void flash_attn_bwd(const bf16* q, const bf16* k, const bf16* v, const bf16* o, const bf16* dout, const float* lse,
                     float* dvec, float* dq_acc, bf16* dk, bf16* dv, int B, int S, int Hq, int Hkv, float scale,
@@ -461,13 +476,13 @@ void flash_attn_bwd(const bf16* q, const bf16* k, const bf16* v, const bf16* o, 
     static bool cfg = false;
     if (!cfg) { cudaFuncSetAttribute(flash_bwd_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); cfg = true; }
     dim3 grid((S + 63) / 64, Hkv, B);
-    flash_bwd_kernel<4><<<grid, 128, smem, st>>>(q, k, v, dout, lse, dvec, dq_acc, dk, dv, S, Hq, Hkv, scale);
+    flash_bwd_kernel<4><<<grid, 128, smem, st>>>(q, k, v, dout, lse, dvec, dq_acc, dk, dv, S, Hq, Hkv, scale, g_bwd_dbg);
   } else {
     constexpr int smem = bwd_smem<8>();
     static bool cfg = false;
     if (!cfg) { cudaFuncSetAttribute(flash_bwd_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); cfg = true; }
     dim3 grid((S + 127) / 128, Hkv, B);
-    flash_bwd_kernel<8><<<grid, 256, smem, st>>>(q, k, v, dout, lse, dvec, dq_acc, dk, dv, S, Hq, Hkv, scale);
+    flash_bwd_kernel<8><<<grid, 256, smem, st>>>(q, k, v, dout, lse, dvec, dq_acc, dk, dv, S, Hq, Hkv, scale, g_bwd_dbg);
   }
 }
 

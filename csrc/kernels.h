@@ -43,7 +43,8 @@ void flash_attn_bwd(const bf16* q, const bf16* k, const bf16* v, const bf16* o, 
                     cudaStream_t st);
 
 void flash_fwd_set_warps(int nw);  // 4 (64-row Q tiles, default) or 8 (128-row)
-void flash_bwd_set_warps(int nw);  // 4 (64-key blocks) or 8 (128-key blocks, default)
+void flash_bwd_set_warps(int nw);
+void flash_bwd_set_debug(int flags);  // timing experiments only  // 4 (64-key blocks) or 8 (128-key blocks, default)
 
 void swiglu_fwd(const bf16* gu, bf16* h, long T, int I, cudaStream_t st);
 void swiglu_bwd(const bf16* dh, const bf16* gu, bf16* dgu, long T, int I, cudaStream_t st);
