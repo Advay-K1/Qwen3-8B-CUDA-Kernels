@@ -417,22 +417,22 @@ constexpr size_t smem_bytes() {
 }
 
 template <int NB>
-void launch_nb(const MegaParams& p, int grid, cudaStream_t st) {
+cudaError_t launch_nb(const MegaParams& p, int grid, cudaStream_t st) {
   auto k = decode_megakernel<NB>;
   constexpr size_t smem = smem_bytes<NB>();
   cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
   MegaParams pp = p;
   void* args[] = {&pp};
-  cudaLaunchCooperativeKernel((void*)k, dim3(grid), dim3(THREADS), args, smem, st);
+  return cudaLaunchCooperativeKernel((void*)k, dim3(grid), dim3(THREADS), args, smem, st);
 }
 
-void launch(const MegaParams& p, int grid, cudaStream_t st) {
+cudaError_t launch(const MegaParams& p, int grid, cudaStream_t st) {
   switch (p.B) {
-    case 1: launch_nb<1>(p, grid, st); break;
-    case 2: launch_nb<2>(p, grid, st); break;
-    case 3: launch_nb<3>(p, grid, st); break;
-    case 4: launch_nb<4>(p, grid, st); break;
-    default: break;
+    case 1: return launch_nb<1>(p, grid, st);
+    case 2: return launch_nb<2>(p, grid, st);
+    case 3: return launch_nb<3>(p, grid, st);
+    case 4: return launch_nb<4>(p, grid, st);
+    default: return cudaErrorInvalidValue;
   }
 }
 

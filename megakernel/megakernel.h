@@ -37,6 +37,6 @@ struct MegaParams {
   unsigned* bar;          // grid barrier counter (zeroed before launch)
 };
 
-void launch(const MegaParams& p, int grid, cudaStream_t st);
+cudaError_t launch(const MegaParams& p, int grid, cudaStream_t st);
 int max_grid(int B, int num_sms);
 }  // namespace mk

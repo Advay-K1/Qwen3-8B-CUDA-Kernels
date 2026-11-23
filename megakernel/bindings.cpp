@@ -65,8 +65,7 @@ void decode_step(const Tensor& layers, int64_t n_layers, const c10::optional<Ten
   p.bar = reinterpret_cast<unsigned*>(bar.data_ptr<int32_t>());
   auto st = at::cuda::getCurrentCUDAStream();
   cudaMemsetAsync(p.bar, 0, sizeof(unsigned), st);
-  mk::launch(p, grid, st);
-  auto err = cudaGetLastError();
+  auto err = mk::launch(p, grid, st);
   TORCH_CHECK(err == cudaSuccess, "megakernel launch failed: ", cudaGetErrorString(err));
 }
 }  // namespace
