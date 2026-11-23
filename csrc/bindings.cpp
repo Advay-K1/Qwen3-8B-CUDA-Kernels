@@ -14,11 +14,15 @@ namespace {
 #define CHECK_CONTIG(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define CHECK_BF16(x) TORCH_CHECK((x).scalar_type() == torch::kBFloat16, #x " must be bfloat16")
 #define CHECK_IN(x) \
-  CHECK_CUDA(x);    \
-  CHECK_CONTIG(x)
+  do {              \
+    CHECK_CUDA(x);  \
+    CHECK_CONTIG(x); \
+  } while (0)
 #define CHECK_BF16_IN(x) \
-  CHECK_IN(x);           \
-  CHECK_BF16(x)
+  do {                   \
+    CHECK_IN(x);         \
+    CHECK_BF16(x);       \
+  } while (0)
 
 inline qk::bf16* bp(const Tensor& t) { return reinterpret_cast<qk::bf16*>(t.data_ptr()); }
 inline const qk::bf16* cbp(const optional<Tensor>& t) {
