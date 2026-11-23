@@ -41,6 +41,8 @@ void flash_attn_bwd(const bf16* q, const bf16* k, const bf16* v, const bf16* o, 
                     float* dvec, float* dq_acc, bf16* dk, bf16* dv, int B, int S, int Hq, int Hkv, float scale,
                     cudaStream_t st);
 
+void flash_bwd_set_warps(int nw);  // 4 (64-key blocks) or 8 (128-key blocks, default)
+
 void swiglu_fwd(const bf16* gu, bf16* h, long T, int I, cudaStream_t st);
 void swiglu_bwd(const bf16* dh, const bf16* gu, bf16* dgu, long T, int I, cudaStream_t st);
 void embedding_fwd(const int* ids, const bf16* table, bf16* out, long T, int H, cudaStream_t st);

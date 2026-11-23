@@ -324,6 +324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("flash_fwd", &flash_fwd, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("scale"),
         py::arg("need_lse") = true);
   m.def("flash_bwd", &flash_bwd);
+  m.def("flash_bwd_set_warps", &qk::flash_bwd_set_warps);
   m.def("swiglu_fwd", &swiglu_fwd);
   m.def("swiglu_bwd", &swiglu_bwd);
   m.def("embedding_fwd", &embedding_fwd);
