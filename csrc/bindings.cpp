@@ -312,6 +312,7 @@ Tensor decode_attn(const Tensor& q, const Tensor& kc, const Tensor& vc, const Te
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &gemm);
+  m.def("gemm_force_config", &qk::gemm_force_config);
   m.def("rmsnorm_fwd", &rmsnorm_fwd, py::arg("x"), py::arg("w"), py::arg("eps"), py::arg("residual") = py::none());
   m.def("rmsnorm_bwd", &rmsnorm_bwd, py::arg("dy"), py::arg("x"), py::arg("w"), py::arg("rstd"),
         py::arg("dres") = py::none());

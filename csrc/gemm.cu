@@ -15,10 +15,11 @@
 namespace qk {
 namespace {
 
-constexpr int BM = 128, BN = 128, BK = 64, STAGES = 3, THREADS = 256;
-constexpr int WM = 64, WN = 32;  // warp tile, warps arranged 2 (M) x 4 (N)
-constexpr int A_TILE = BM * BK, B_TILE = BN * BK;
-constexpr int SMEM_BYTES = STAGES * (A_TILE + B_TILE) * 2;
+// CTA tile BM x BN x BK, 8 warps arranged 2 (M) x 4 (N), warp tile WM x WN (WN = BN / 4).
+constexpr int BM = 128, BK = 64, THREADS = 256, WM = 64;
+constexpr int A_TILE = BM * BK;
+template <int BN, int STAGES>
+constexpr int smem_bytes() { return STAGES * (A_TILE + BN * BK) * 2; }
 
 struct Epi {
   float alpha;
@@ -59,10 +60,12 @@ QK_DEVICE void load_tile(bf16* s, const bf16* g, int ld, int mn0, int k0, int MN
   }
 }
 
-template <bool A_KMAJOR, bool B_KMAJOR>
+template <bool A_KMAJOR, bool B_KMAJOR, int BN, int STAGES>
 __global__ void __launch_bounds__(THREADS)
 gemm_kernel(const bf16* __restrict__ A, const bf16* __restrict__ B, void* __restrict__ C,
             int M, int N, int K, int lda, int ldb, int ldc, Epi epi) {
+  constexpr int WN = BN / 4;
+  constexpr int B_TILE = BN * BK;
   extern __shared__ __align__(128) uint8_t smem_raw[];
   bf16* sA = reinterpret_cast<bf16*>(smem_raw);
   bf16* sB = sA + STAGES * A_TILE;
@@ -198,20 +201,40 @@ gemm_kernel(const bf16* __restrict__ A, const bf16* __restrict__ B, void* __rest
   }
 }
 
-template <bool AK, bool BK_>
-void launch(const GemmArgs& a, cudaStream_t st) {
-  auto k = gemm_kernel<AK, BK_>;
+template <bool AK, bool BK_, int BN, int STAGES>
+void launch_cfg(const GemmArgs& a, cudaStream_t st) {
+  auto k = gemm_kernel<AK, BK_, BN, STAGES>;
+  constexpr int smem = smem_bytes<BN, STAGES>();
   static bool configured = false;  // one flag per instantiation
   if (!configured) {
-    cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+    cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     configured = true;
   }
   int grid = ((a.M + BM - 1) / BM) * ((a.N + BN - 1) / BN);
   Epi e{a.alpha, a.R, a.ldr, a.out_f32, a.accumulate};
-  k<<<grid, THREADS, SMEM_BYTES, st>>>(a.A, a.B, a.C, a.M, a.N, a.K, a.lda, a.ldb, a.ldc, e);
+  k<<<grid, THREADS, smem, st>>>(a.A, a.B, a.C, a.M, a.N, a.K, a.lda, a.ldb, a.ldc, e);
+}
+
+int g_num_sms = 0;
+int g_force_cfg = -1;  // -1: heuristic, 0: 128x128, 1: 128x256
+
+template <bool AK, bool BK_>
+void launch(const GemmArgs& a, cudaStream_t st) {
+  if (!g_num_sms) {
+    int dev;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&g_num_sms, cudaDevAttrMultiProcessorCount, dev);
+  }
+  // Big tiles when there are enough of them to fill the GPU at least twice.
+  long big_tiles = (long)((a.M + BM - 1) / BM) * ((a.N + 255) / 256);
+  bool big = g_force_cfg >= 0 ? g_force_cfg == 1 : big_tiles >= 2L * g_num_sms;
+  if (big) launch_cfg<AK, BK_, 256, 3>(a, st);
+  else launch_cfg<AK, BK_, 128, 4>(a, st);
 }
 
 }  // namespace
+
+void gemm_force_config(int cfg) { g_force_cfg = cfg; }
 
 void gemm(const GemmArgs& a, cudaStream_t st) {
   if (a.M <= 0 || a.N <= 0) return;

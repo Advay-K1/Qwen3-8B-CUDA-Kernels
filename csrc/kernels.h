@@ -20,6 +20,7 @@ struct GemmArgs {
   bool accumulate = false;
 };
 void gemm(const GemmArgs& a, cudaStream_t st);
+void gemm_force_config(int cfg);  // -1 heuristic, 0 = 128x128, 1 = 128x256 (benchmarking)
 
 void rmsnorm_fwd(const bf16* x, const bf16* res, const bf16* w, bf16* y, bf16* s_out, float* rstd, int rows, int H,
                  float eps, cudaStream_t st);
