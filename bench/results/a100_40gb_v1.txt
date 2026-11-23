@@ -1,0 +1,16 @@
+NVIDIA A100-SXM4-40GB, torch 2.12 / CUDA 13.2, commit after "Fix optional-tensor check macros"
+== GEMM (T=4096)  TFLOP/s  ours | cuBLAS
+  qkv      fwd  177.8 |  252.4   dx  175.2 |  261.8   dW  165.2 |  243.4
+  o_proj   fwd  165.3 |  252.4   dx  165.6 |  253.4   dW  165.8 |  255.9
+  gate_up  fwd  179.3 |  257.9   dx  173.5 |  260.4   dW  174.3 |  260.7
+  down     fwd  174.4 |  261.4   dx  168.8 |  256.2   dW  170.8 |  259.4
+  lm_head  fwd  181.6 |  254.0   dx  171.6 |  258.7   dW  178.7 |  255.7
+== Flash attention (B=1 S=4096 Hq=32 Hkv=8, causal)  ms  ours | torch SDPA
+  fwd   1.121 |   0.871 ms   (122.6 | 157.8 TFLOP/s)
+  bwd   5.320 |   2.500 ms   ( 64.6 | 137.4 TFLOP/s)
+== Full decoder layer fwd+bwd (B=1, S=4096), random weights
+  fwd 10.44 ms (164.6 TFLOP/s)   fwd+bwd 35.62 ms (144.7 TFLOP/s)
+== Decode (Qwen3-8B real weights, B=1, context 512)
+  layered kernels         13.432 ms/token     74.4 tok/s   1132.5 GB/s effective
+  layered + CUDA graph    12.926 ms/token     77.4 tok/s   1176.9 GB/s effective
+  megakernel              12.120 ms/token     82.5 tok/s   1255.2 GB/s effective
