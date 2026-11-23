@@ -75,6 +75,13 @@ QK_DEVICE uint32_t pack_bf162(float a, float b) {
 }
 
 // ---------------------------------------------------------------- PTX wrappers
+// Hardware 2^x (MUFU.EX2). ex2(-inf) = +0.
+QK_DEVICE float ex2(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(y) : "f"(x));
+  return y;
+}
+
 QK_DEVICE uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }

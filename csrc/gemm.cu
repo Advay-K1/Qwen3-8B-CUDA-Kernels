@@ -19,7 +19,9 @@ namespace {
 constexpr int BM = 128, BK = 64, THREADS = 256, WM = 64;
 constexpr int A_TILE = BM * BK;
 template <int BN, int STAGES>
-constexpr int smem_bytes() { return STAGES * (A_TILE + BN * BK) * 2; }
+constexpr int smem_bytes() {
+  return STAGES * (A_TILE + BN * BK) * 2 > BM * (BN + 4) * 4 ? STAGES * (A_TILE + BN * BK) * 2 : BM * (BN + 4) * 4;
+}
 
 struct Epi {
   float alpha;
@@ -29,36 +31,52 @@ struct Epi {
   bool accumulate;  // C += result (C must be fp32 or bf16 per out_f32)
 };
 
-// Load one BMxBK (or BNxBK) operand tile into swizzled smem.
+// cp.async tile loader with all per-thread addressing precomputed once.
 // KMAJOR: smem tile is [rows=MN][cols=BK]; else [rows=BK][cols=MN].
+// Every thread copies the same chunk column in every k-tile, so a single base
+// pointer + a row-valid bitmask + a smem offset describe all of its copies.
 template <bool KMAJOR, int MN>
-QK_DEVICE void load_tile(bf16* s, const bf16* g, int ld, int mn0, int k0, int MNsz, int Ksz, int tid) {
-  if constexpr (KMAJOR) {
-    constexpr int CPR = BK / 8;  // chunks per row
-    constexpr int TOTAL = MN * CPR;
+struct TileLoader {
+  static constexpr int COLS = KMAJOR ? BK : MN;
+  static constexpr int CPR = COLS / 8;
+  static constexpr int RPI = THREADS / CPR;  // rows per iteration
+  static constexpr int ITERS = (KMAJOR ? MN : BK) / RPI;
+  static_assert(ITERS <= 32, "row mask");
+  const bf16* g;
+  int ld, c8, r0;
+  uint32_t s_off, mask;
+
+  QK_DEVICE void init(const bf16* g0, int ld_, int mn0, int MNsz, int tid) {
+    ld = ld_;
+    r0 = tid / CPR;
+    c8 = (tid % CPR) * 8;
+    s_off = swz<COLS>(r0, c8) * 2;
+    mask = 0;
+    if constexpr (KMAJOR) {
+      g = g0 + (size_t)(mn0 + r0) * ld + c8;
 #pragma unroll
-    for (int i = 0; i < TOTAL / THREADS; ++i) {
-      int id = tid + i * THREADS;
-      int r = id / CPR, c = id % CPR;
-      int gm = mn0 + r, gk = k0 + c * 8;
-      bool p = (gm < MNsz) && (gk < Ksz);
-      const bf16* src = p ? g + (size_t)gm * ld + gk : g;
-      cp_async16(smem_u32(s + swz<BK>(r, c * 8)), src, p);
-    }
-  } else {
-    constexpr int CPR = MN / 8;
-    constexpr int TOTAL = BK * CPR;
-#pragma unroll
-    for (int i = 0; i < TOTAL / THREADS; ++i) {
-      int id = tid + i * THREADS;
-      int r = id / CPR, c = id % CPR;
-      int gk = k0 + r, gm = mn0 + c * 8;
-      bool p = (gk < Ksz) && (gm < MNsz);
-      const bf16* src = p ? g + (size_t)gk * ld + gm : g;
-      cp_async16(smem_u32(s + swz<MN>(r, c * 8)), src, p);
+      for (int it = 0; it < ITERS; ++it) mask |= (uint32_t)(mn0 + r0 + it * RPI < MNsz) << it;
+    } else {
+      g = g0 + (size_t)r0 * ld + mn0 + c8;
+      mask = (mn0 + c8 < MNsz) ? 0xffffffffu : 0u;
     }
   }
-}
+  QK_DEVICE void load(uint32_t stage_base, int k0, int Ksz) const {
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+      bool p;
+      const bf16* src;
+      if constexpr (KMAJOR) {
+        p = ((mask >> it) & 1) && (k0 + c8 < Ksz);
+        src = g + (size_t)it * RPI * ld + k0;
+      } else {
+        p = (mask & 1) && (k0 + r0 + it * RPI < Ksz);
+        src = g + (size_t)(k0 + it * RPI) * ld;
+      }
+      cp_async16(stage_base + s_off + it * RPI * COLS * 2, src, p);  // src-size 0 when !p: nothing read
+    }
+  }
+};
 
 template <bool A_KMAJOR, bool B_KMAJOR, int BN, int STAGES>
 __global__ void __launch_bounds__(THREADS)
@@ -87,9 +105,14 @@ gemm_kernel(const bf16* __restrict__ A, const bf16* __restrict__ B, void* __rest
 
   const int KT = (K + BK - 1) / BK;
 
+  TileLoader<A_KMAJOR, BM> la;
+  TileLoader<B_KMAJOR, BN> lb;
+  la.init(A, lda, m0, M, tid);
+  lb.init(B, ldb, n0, N, tid);
+  const uint32_t sA0 = smem_u32(sA), sB0 = smem_u32(sB);
   auto load_stage = [&](int stage, int kt) {
-    load_tile<A_KMAJOR, BM>(sA + stage * A_TILE, A, lda, m0, kt * BK, M, K, tid);
-    load_tile<B_KMAJOR, BN>(sB + stage * B_TILE, B, ldb, n0, kt * BK, N, K, tid);
+    la.load(sA0 + stage * (A_TILE * 2), kt * BK, K);
+    lb.load(sB0 + stage * (B_TILE * 2), kt * BK, K);
   };
 
 #pragma unroll
@@ -108,93 +131,159 @@ gemm_kernel(const bf16* __restrict__ A, const bf16* __restrict__ B, void* __rest
 
   const int wm0 = warp_m * WM, wn0 = warp_n * WN;
 
-  for (int kt = 0; kt < KT; ++kt) {
-    cp_async_wait<STAGES - 2>();
-    __syncthreads();
-    {
-      int nk = kt + STAGES - 1;
-      if (nk < KT) load_stage(nk % STAGES, nk);
-      cp_async_commit();
-    }
-    const bf16* tA = sA + (kt % STAGES) * A_TILE;
-    const bf16* tB = sB + (kt % STAGES) * B_TILE;
+  // Precomputed per-lane ldmatrix byte offsets. The XOR swizzle only touches the low 3
+  // chunk bits, which are disjoint from the k-step / tile-index bits, so it is linear:
+  // address = stage_base + lane_base + compile-time offset + x[step or tile].
+  const int l7 = lane & 7, jq = lane >> 3;
+  uint32_t a_lane, b_lane, a_x[4], b_x[4];
+  if constexpr (A_KMAJOR) {  // tile [BM][BK]
+    a_lane = (wm0 + (lane & 15)) * BK * 2;
+    const int xa = (lane >> 4) ^ l7;
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) a_x[kk] = ((2 * kk) ^ xa) << 4;
+  } else {  // tile [BK][BM]
+    a_lane = ((jq >> 1) * 8 + l7) * BM * 2 + wm0 * 2;
+    const int ya = (jq & 1) ^ l7;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) a_x[i] = ((2 * i) ^ ya) << 4;
+  }
+  if constexpr (B_KMAJOR) {  // tile [BN][BK]
+    b_lane = (wn0 + (jq >> 1) * 8 + l7) * BK * 2;
+    const int xb = (jq & 1) ^ l7;
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) b_x[kk] = ((2 * kk) ^ xb) << 4;
+  } else {  // tile [BK][BN]
+    const int lo = (wn0 / 8) & 7, hi = (wn0 / 8) & ~7;
+    b_lane = ((jq & 1) * 8 + l7) * BN * 2 + hi * 16;
+    const int yb = lo ^ (jq >> 1) ^ l7;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) b_x[p] = ((2 * p) ^ yb) << 4;
+  }
+  const uint32_t sA_u = smem_u32(sA) + a_lane, sB_u = smem_u32(sB) + b_lane;
 
+  // Register fragments, double-buffered across k16 steps.
+  uint32_t af[2][WM / 16][4];
+  uint32_t bfr[2][WN / 8][2];
+  auto load_frags = [&](int buf, int stage, int kk) {
+    const uint32_t ta = sA_u + stage * (A_TILE * 2), tb = sB_u + stage * (B_TILE * 2);
 #pragma unroll
-    for (int kk = 0; kk < BK / 16; ++kk) {
-      uint32_t af[WM / 16][4];
-      uint32_t bfr[WN / 8][2];
+    for (int i = 0; i < WM / 16; ++i) {
+      if constexpr (A_KMAJOR)
+        ldmatrix_x4(af[buf][i][0], af[buf][i][1], af[buf][i][2], af[buf][i][3], ta + i * 16 * BK * 2 + a_x[kk]);
+      else
+        ldmatrix_x4_trans(af[buf][i][0], af[buf][i][1], af[buf][i][2], af[buf][i][3],
+                          ta + kk * 16 * BM * 2 + a_x[i]);
+    }
 #pragma unroll
-      for (int i = 0; i < WM / 16; ++i) {
-        if constexpr (A_KMAJOR) {
-          int r = wm0 + i * 16 + (lane & 15);
-          int c = kk * 16 + (lane >> 4) * 8;
-          ldmatrix_x4(af[i][0], af[i][1], af[i][2], af[i][3], smem_u32(tA + swz<BK>(r, c)));
-        } else {
-          int j = lane >> 3;
-          int r = kk * 16 + (j >> 1) * 8 + (lane & 7);
-          int c = wm0 + i * 16 + (j & 1) * 8;
-          ldmatrix_x4_trans(af[i][0], af[i][1], af[i][2], af[i][3], smem_u32(tA + swz<BM>(r, c)));
-        }
+    for (int p = 0; p < WN / 16; ++p) {
+      if constexpr (B_KMAJOR)
+        ldmatrix_x4(bfr[buf][2 * p][0], bfr[buf][2 * p][1], bfr[buf][2 * p + 1][0], bfr[buf][2 * p + 1][1],
+                    tb + p * 16 * BK * 2 + b_x[kk]);
+      else
+        ldmatrix_x4_trans(bfr[buf][2 * p][0], bfr[buf][2 * p][1], bfr[buf][2 * p + 1][0], bfr[buf][2 * p + 1][1],
+                          tb + kk * 16 * BN * 2 + b_x[p]);
+    }
+  };
+
+  constexpr int KSTEPS = BK / 16;
+  cp_async_wait<STAGES - 2>();
+  __syncthreads();
+  load_frags(0, 0, 0);
+
+  int stage = 0;
+  for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+    for (int kk = 0; kk < KSTEPS; ++kk) {
+      int fstage = stage;
+      if (kk == KSTEPS - 1) {
+        // Next k-tile must be resident before its first fragments are loaded.
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        fstage = (stage + 1 == STAGES) ? 0 : stage + 1;
       }
-#pragma unroll
-      for (int p = 0; p < WN / 16; ++p) {
-        int j = lane >> 3;
-        if constexpr (B_KMAJOR) {
-          int r = wn0 + p * 16 + (j >> 1) * 8 + (lane & 7);
-          int c = kk * 16 + (j & 1) * 8;
-          ldmatrix_x4(bfr[2 * p][0], bfr[2 * p][1], bfr[2 * p + 1][0], bfr[2 * p + 1][1],
-                      smem_u32(tB + swz<BK>(r, c)));
-        } else {
-          int r = kk * 16 + (j & 1) * 8 + (lane & 7);
-          int c = wn0 + p * 16 + (j >> 1) * 8;
-          ldmatrix_x4_trans(bfr[2 * p][0], bfr[2 * p][1], bfr[2 * p + 1][0], bfr[2 * p + 1][1],
-                            smem_u32(tB + swz<BN>(r, c)));
-        }
+      load_frags((kk + 1) & 1, fstage, (kk + 1) % KSTEPS);  // prefetch next k16 step
+      if (kk == 0) {
+        // Refill the stage consumed in the previous iteration (all warps passed its last read).
+        int nk = kt + STAGES - 1;
+        if (nk < KT) load_stage(nk % STAGES, nk);
+        cp_async_commit();
       }
 #pragma unroll
       for (int i = 0; i < WM / 16; ++i)
 #pragma unroll
-        for (int j = 0; j < WN / 8; ++j) mma_bf16_16816(acc[i][j], af[i], bfr[j]);
+        for (int j = 0; j < WN / 8; ++j) mma_bf16_16816(acc[i][j], af[kk & 1][i], bfr[kk & 1][j]);
     }
+    stage = (stage + 1 == STAGES) ? 0 : stage + 1;
   }
   cp_async_wait<0>();
+  __syncthreads();
 
-  // Epilogue.
-  const int g = lane >> 2, t = lane & 3;
+  // Epilogue: stage the fp32 tile in smem, then 16-byte coalesced stores with fused residual / accumulate.
+  constexpr int CST = BN + 4;  // padded row stride (floats)
+  float* sC = reinterpret_cast<float*>(smem_raw);
+  {
+    const int g = lane >> 2, t = lane & 3;
 #pragma unroll
-  for (int i = 0; i < WM / 16; ++i) {
+    for (int i = 0; i < WM / 16; ++i)
 #pragma unroll
-    for (int j = 0; j < WN / 8; ++j) {
-      int col = n0 + wn0 + j * 8 + 2 * t;
-      if (col >= N) continue;
+      for (int j = 0; j < WN / 8; ++j)
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        int row = m0 + wm0 + i * 16 + g + h * 8;
-        if (row >= M) continue;
-        float v0 = acc[i][j][2 * h] * epi.alpha;
-        float v1 = acc[i][j][2 * h + 1] * epi.alpha;
-        if (epi.R) {
-          float2 r = __bfloat1622float2(*reinterpret_cast<const bf162*>(epi.R + (size_t)row * epi.ldr + col));
-          v0 += r.x;
-          v1 += r.y;
+        for (int h = 0; h < 2; ++h)
+          *reinterpret_cast<float2*>(sC + (wm0 + i * 16 + g + h * 8) * CST + wn0 + j * 8 + 2 * t) =
+              make_float2(acc[i][j][2 * h] * epi.alpha, acc[i][j][2 * h + 1] * epi.alpha);
+  }
+  __syncthreads();
+  constexpr int CPR = BN / 8;
+#pragma unroll 4
+  for (int id = tid; id < BM * CPR; id += THREADS) {
+    const int r = id / CPR, c8 = (id % CPR) * 8;
+    const int row = m0 + r, col = n0 + c8;
+    if (row >= M || col >= N) continue;
+    float v[8];
+    *reinterpret_cast<float4*>(v) = *reinterpret_cast<const float4*>(sC + r * CST + c8);
+    *reinterpret_cast<float4*>(v + 4) = *reinterpret_cast<const float4*>(sC + r * CST + c8 + 4);
+    const size_t off = (size_t)row * ldc + col;
+    if (col + 8 <= N) {
+      if (epi.R) {
+        float rr[8];
+        unpack8(*reinterpret_cast<const uint4*>(epi.R + (size_t)row * epi.ldr + col), rr);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) v[k] += rr[k];
+      }
+      if (epi.out_f32) {
+        float4* pc = reinterpret_cast<float4*>(reinterpret_cast<float*>(C) + off);
+        if (epi.accumulate) {
+          float4 a0 = pc[0], a1 = pc[1];
+          v[0] += a0.x; v[1] += a0.y; v[2] += a0.z; v[3] += a0.w;
+          v[4] += a1.x; v[5] += a1.y; v[6] += a1.z; v[7] += a1.w;
         }
-        size_t off = (size_t)row * ldc + col;
+        pc[0] = make_float4(v[0], v[1], v[2], v[3]);
+        pc[1] = make_float4(v[4], v[5], v[6], v[7]);
+      } else {
+        uint4* pc = reinterpret_cast<uint4*>(reinterpret_cast<bf16*>(C) + off);
+        if (epi.accumulate) {
+          float o[8];
+          unpack8(*pc, o);
+#pragma unroll
+          for (int k = 0; k < 8; ++k) v[k] += o[k];
+        }
+        *pc = pack8(v);
+      }
+    } else {  // ragged N tail (N even): pairs
+      for (int k = 0; k < 8 && col + k < N; k += 2) {
+        float v0 = v[k], v1 = v[k + 1];
+        if (epi.R) {
+          float2 rr = __bfloat1622float2(*reinterpret_cast<const bf162*>(epi.R + (size_t)row * epi.ldr + col + k));
+          v0 += rr.x; v1 += rr.y;
+        }
         if (epi.out_f32) {
-          float2* p = reinterpret_cast<float2*>(reinterpret_cast<float*>(C) + off);
-          if (epi.accumulate) {
-            float2 o = *p;
-            v0 += o.x;
-            v1 += o.y;
-          }
-          *p = make_float2(v0, v1);
+          float2* pc = reinterpret_cast<float2*>(reinterpret_cast<float*>(C) + off + k);
+          if (epi.accumulate) { float2 o = *pc; v0 += o.x; v1 += o.y; }
+          *pc = make_float2(v0, v1);
         } else {
-          bf162* p = reinterpret_cast<bf162*>(reinterpret_cast<bf16*>(C) + off);
-          if (epi.accumulate) {
-            float2 o = __bfloat1622float2(*p);
-            v0 += o.x;
-            v1 += o.y;
-          }
-          *p = __floats2bfloat162_rn(v0, v1);
+          bf162* pc = reinterpret_cast<bf162*>(reinterpret_cast<bf16*>(C) + off + k);
+          if (epi.accumulate) { float2 o = __bfloat1622float2(*pc); v0 += o.x; v1 += o.y; }
+          *pc = __floats2bfloat162_rn(v0, v1);
         }
       }
     }

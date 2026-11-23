@@ -51,6 +51,12 @@ QK_DEVICE void prefetch_l2(const void* p, size_t bytes) {
     asm volatile("prefetch.global.L2 [%0];\n" ::"l"(c + off));
 }
 
+QK_DEVICE unsigned long long gtimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+  return t;
+}
+
 QK_DEVICE void grid_sync(unsigned* bar, unsigned& target) {
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -352,6 +358,12 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
 
   unsigned target = 0;
   bf16* x = p.x;
+  int tick = 0;
+  auto stamp = [&]() {
+    if (p.timing && blockIdx.x == 0 && threadIdx.x == 0) p.timing[tick] = gtimer();
+    ++tick;
+  };
+  stamp();
 
   if (p.tokens) {  // embedding lookup
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < NB * H / 8; i += gridDim.x * THREADS) {
@@ -360,6 +372,7 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
           __ldg(reinterpret_cast<const uint4*>(p.embed + (size_t)p.tokens[b] * H) + c);
     }
     grid_sync(p.bar, target);
+    stamp();
   }
 
   for (int layer = 0; layer < p.n_layers; ++layer) {
@@ -372,17 +385,20 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
     block_gemv<NB>(L.qkv, H, r0, r1, sx, spart,
                    [&](int row, int b, float v) { p.qkv[(size_t)b * QKV + row] = __float2bfloat16(v); });
     grid_sync(p.bar, target);
+    stamp();
 
     // S2: attention partials (+ q/k norm, rope, cache append)
     // HBM is mostly idle in S2/S3: stream this CTA's whole O-proj slice into L2 meanwhile.
     if (p.prefetch & 1) prefetch_slice(L.o, H, H, H);
     for (int item = blockIdx.x; item < NB * HKV * p.nsplit; item += gridDim.x) attn_item<NB>(p, L, layer, item, sa);
     grid_sync(p.bar, target);
+    stamp();
 
     // S3: combine
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < NB * HQ * D; i += gridDim.x * THREADS)
       combine_item(p, i / D, i % D);
     grid_sync(p.bar, target);
+    stamp();
 
     // S4: O projection + residual
     load_vec<NB>(p.attn_out, H, sx);
@@ -396,6 +412,7 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
       prefetch_slice(L.gate_up + (size_t)I * H, I, H, 8);
     }
     grid_sync(p.bar, target);
+    stamp();
 
     // S5: post norm + gate/up + SwiGLU
     load_norm<NB>(x, L.post_ln, sx, p.eps, red);
@@ -412,6 +429,7 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
     }
     if (p.prefetch & 2) prefetch_slice(L.down, H, I, 4);
     grid_sync(p.bar, target);
+    stamp();
 
     // S6: down projection + residual
     load_vec<NB>(p.h, I, sx);
@@ -425,6 +443,7 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
       else if (p.lm_head) prefetch_slice(p.lm_head, p.vocab, H, 16);
     }
     grid_sync(p.bar, target);
+    stamp();
   }
 
   if (p.lm_head) {  // final norm + LM head
@@ -433,6 +452,8 @@ __global__ void __launch_bounds__(THREADS, 1) decode_megakernel(MegaParams p) {
     rows_of(p.vocab, r0, r1);
     block_gemv<NB>(p.lm_head, H, r0, r1, sx, spart,
                    [&](int row, int b, float v) { p.logits[(size_t)b * p.vocab + row] = v; });
+    __syncthreads();
+    stamp();
   }
 }
 

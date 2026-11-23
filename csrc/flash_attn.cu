@@ -46,31 +46,37 @@ QK_DEVICE void load_rows(bf16* s, const bf16* g, size_t row_stride, int nrows, i
 }
 
 // ============================================================== forward
-__global__ void __launch_bounds__(NW * 32)
+// NWF warps x 16 query rows. smem: 2 stages of [K 64x128 | V 64x128]; the Q tile
+// (<= 128 rows = one stage) is staged in stage 1 and moved to registers before
+// stage 1 is first refilled.
+template <int NWF>
+__global__ void __launch_bounds__(NWF * 32)
 flash_fwd_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ V,
                  bf16* __restrict__ O, float* __restrict__ LSE, int S, int Hq, int Hkv, int kv_S,
                  float scale_log2) {
+  constexpr int BRF = 16 * NWF, NT = NWF * 32;
   extern __shared__ __align__(128) uint8_t smem_raw[];
-  bf16* sQ = reinterpret_cast<bf16*>(smem_raw);
-  bf16* sK = sQ + TILE;      // 2 stages
-  bf16* sV = sK + 2 * TILE;  // 2 stages
+  bf16* sbase = reinterpret_cast<bf16*>(smem_raw);
+  auto sK = [&](int st) { return sbase + st * 2 * TILE; };
+  auto sV = [&](int st) { return sbase + st * 2 * TILE + TILE; };
+  bf16* sQ = sbase + 2 * TILE;  // aliases stage 1
 
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, t = lane & 3, jj = lane >> 3;
   const int qb = gridDim.x - 1 - blockIdx.x;  // heaviest blocks first
   const int h = blockIdx.y, b = blockIdx.z;
   const int hk = h / (Hq / Hkv);
-  const int q0 = qb * BR;
+  const int q0 = qb * BRF;
 
   const bf16* qp = Q + ((size_t)(b * Hq + h) * S + q0) * D;
   const bf16* kp = K + (size_t)(b * Hkv + hk) * kv_S * D;
   const bf16* vp = V + (size_t)(b * Hkv + hk) * kv_S * D;
 
-  const int nkv = min((S + BC - 1) / BC, (q0 + BR + BC - 1) / BC);
+  const int nkv = min((S + BC - 1) / BC, (q0 + BRF + BC - 1) / BC);
 
-  load_tile64(sQ, qp, D, S - q0, tid);
-  load_tile64(sK, kp, D, S, tid);
-  load_tile64(sV, vp, D, S, tid);
+  load_rows<BRF, NT>(sQ, qp, D, S - q0, tid);
+  load_rows<64, NT>(sK(0), kp, D, S, tid);
+  load_rows<64, NT>(sV(0), vp, D, S, tid);
   cp_async_commit();
 
   uint32_t qf[D / 16][4];
@@ -88,15 +94,16 @@ flash_fwd_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K, const b
         int r = warp * 16 + (lane & 15), c = kk * 16 + (lane >> 4) * 8;
         ldmatrix_x4(qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], smem_u32(sQ + swz<D>(r, c)));
       }
+      __syncthreads();  // Q (stage 1) fully in registers before stage 1 is refilled
     }
     if (j + 1 < nkv) {
       int st = (j + 1) & 1;
-      load_tile64(sK + st * TILE, kp + (size_t)(j + 1) * BC * D, D, S - (j + 1) * BC, tid);
-      load_tile64(sV + st * TILE, vp + (size_t)(j + 1) * BC * D, D, S - (j + 1) * BC, tid);
+      load_rows<64, NT>(sK(st), kp + (size_t)(j + 1) * BC * D, D, S - (j + 1) * BC, tid);
+      load_rows<64, NT>(sV(st), vp + (size_t)(j + 1) * BC * D, D, S - (j + 1) * BC, tid);
     }
     cp_async_commit();
-    const bf16* tK = sK + (j & 1) * TILE;
-    const bf16* tV = sV + (j & 1) * TILE;
+    const bf16* tK = sK(j & 1);
+    const bf16* tV = sV(j & 1);
 
     // S = Q K^T  (16 x 64 per warp)
     float s[BC / 8][4];
@@ -135,12 +142,12 @@ flash_fwd_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K, const b
       mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
       float m_new = fmaxf(m[hh], mx * scale_log2);
       float m_use = (m_new == -INFINITY) ? 0.f : m_new;
-      float alpha = exp2f(m[hh] - m_use);
+      float alpha = ex2(m[hh] - m_use);
       float rs = 0.f;
 #pragma unroll
       for (int n = 0; n < BC / 8; ++n) {
-        s[n][2 * hh] = exp2f(s[n][2 * hh] * scale_log2 - m_use);
-        s[n][2 * hh + 1] = exp2f(s[n][2 * hh + 1] * scale_log2 - m_use);
+        s[n][2 * hh] = ex2(fmaf(s[n][2 * hh], scale_log2, -m_use));
+        s[n][2 * hh + 1] = ex2(fmaf(s[n][2 * hh + 1], scale_log2, -m_use));
         rs += s[n][2 * hh] + s[n][2 * hh + 1];
       }
       l[hh] = l[hh] * alpha + rs;
@@ -307,7 +314,7 @@ flash_bwd_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K, const b
       for (int e = 0; e < 4; ++e) {
         int ql = n * 8 + 2 * t + (e & 1);
         int key = kv0 + w * 16 + g + (e >> 1) * 8;
-        float p = exp2f(pt[n][e] * scale_log2 - tL[ql]);
+        float p = ex2(fmaf(pt[n][e], scale_log2, -tL[ql]));
         if (need_mask && (key > q0 + ql || key >= S)) p = 0.f;
         pt[n][e] = p;
       }
@@ -423,16 +430,21 @@ flash_bwd_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K, const b
 
 }  // namespace
 
+static int g_fwd_warps = 4;
+void flash_fwd_set_warps(int nw) { g_fwd_warps = nw; }
+
 void flash_attn_fwd(const bf16* q, const bf16* k, const bf16* v, bf16* o, float* lse, int B, int S, int Hq, int Hkv,
                     int kv_S, float scale, cudaStream_t st) {
-  constexpr int smem = 5 * TILE * 2;
-  static bool configured = false;
-  if (!configured) {
-    cudaFuncSetAttribute(flash_fwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    configured = true;
+  constexpr int smem = 4 * TILE * 2;
+  if (g_fwd_warps == 8) {
+    cudaFuncSetAttribute(flash_fwd_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    dim3 grid((S + 127) / 128, Hq, B);
+    flash_fwd_kernel<8><<<grid, 256, smem, st>>>(q, k, v, o, lse, S, Hq, Hkv, kv_S, scale * LOG2E);
+  } else {
+    cudaFuncSetAttribute(flash_fwd_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    dim3 grid((S + 63) / 64, Hq, B);
+    flash_fwd_kernel<4><<<grid, 128, smem, st>>>(q, k, v, o, lse, S, Hq, Hkv, kv_S, scale * LOG2E);
   }
-  dim3 grid((S + BR - 1) / BR, Hq, B);
-  flash_fwd_kernel<<<grid, NW * 32, smem, st>>>(q, k, v, o, lse, S, Hq, Hkv, kv_S, scale * LOG2E);
 }
 
 static int g_bwd_warps = 8;

@@ -35,6 +35,7 @@ struct MegaParams {
   bf16* h;                // [B, I]
   float* logits;          // [B, V]
   unsigned* bar;          // grid barrier counter (zeroed before launch)
+  unsigned long long* timing;  // optional: block 0 writes %globaltimer at each stage boundary
   int prefetch;           // bit0: L2-prefetch O-proj slice during attention; bit1: next-stage rows before barriers.
                           // Measured slower on A100 (L2 contention with the streaming GEMVs); off by default.
 };
