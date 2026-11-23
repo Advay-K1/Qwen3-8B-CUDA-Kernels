@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+*.so
+*.egg-info/
+logs/*.out
+logs/*.err
+.cache/
