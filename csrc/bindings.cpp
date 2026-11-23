@@ -87,10 +87,11 @@ std::vector<Tensor> rmsnorm_bwd(const Tensor& dy, const Tensor& x, const Tensor&
   const int rows = x.numel() / H;
   const c10::cuda::CUDAGuard g(x.device());
   auto dx = torch::empty_like(x);
-  auto dw = torch::zeros({H}, x.options().dtype(torch::kFloat32));
+  auto dw = torch::empty({H}, x.options().dtype(torch::kFloat32));
+  auto part = torch::empty({qk::rmsnorm_bwd_parts(rows, num_sms()), H}, x.options().dtype(torch::kFloat32));
   if (dres.has_value()) CHECK_BF16_IN((*dres));
-  qk::rmsnorm_bwd(bp(dy), bp(x), bp(w), rstd.data_ptr<float>(), cbp(dres), bp(dx), dw.data_ptr<float>(), rows, H,
-                  num_sms(), stream());
+  qk::rmsnorm_bwd(bp(dy), bp(x), bp(w), rstd.data_ptr<float>(), cbp(dres), bp(dx), dw.data_ptr<float>(),
+                  part.data_ptr<float>(), rows, H, num_sms(), stream());
   return {dx, dw};
 }
 

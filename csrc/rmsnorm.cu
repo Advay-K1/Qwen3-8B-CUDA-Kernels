@@ -57,33 +57,49 @@ rmsnorm_fwd_kernel(const bf16* __restrict__ x, const bf16* __restrict__ res, con
 // Backward. x is the normalized input (s for the fused variant).
 //   xhat = x*rstd, gw = dy*w
 //   dx = rstd * (gw - xhat * mean(gw*xhat))   (+ dres_in, the residual-stream grad)
-//   dw += sum_rows dy*xhat                   (fp32 atomics, one per column per block)
-// Each block processes rows blockIdx.x, blockIdx.x+gridDim.x, ...
+//   dw = sum_rows dy*xhat : each CTA writes its column partials to dw_part[blockIdx.x]
+//        (deterministic, no atomics), reduced by rmsnorm_dw_reduce_kernel.
+// One wave of CTAs; each walks rows blockIdx.x, +gridDim.x, ... with the next row's
+// loads issued before the current row's reduction.
+template <int VEC>
 __global__ void __launch_bounds__(THREADS)
 rmsnorm_bwd_kernel(const bf16* __restrict__ dy, const bf16* __restrict__ x, const bf16* __restrict__ w,
-                   const float* __restrict__ rstd, const bf16* __restrict__ dres_in,
-                   bf16* __restrict__ dx, float* __restrict__ dw, int rows, int H) {
+                   const float* __restrict__ rstd, const bf16* __restrict__ dres_in, bf16* __restrict__ dx,
+                   float* __restrict__ dw_part, int rows, int H) {
   __shared__ float red[32];
   const int nvec = H / 8;
-  float wv[MAX_VEC][8], dwacc[MAX_VEC][8];
+  float wv[VEC][8], dwacc[VEC][8];
 #pragma unroll
-  for (int i = 0; i < MAX_VEC; ++i) {
+  for (int i = 0; i < VEC; ++i) {
     int c = threadIdx.x + i * THREADS;
 #pragma unroll
     for (int k = 0; k < 8; ++k) dwacc[i][k] = 0.f;
     if (c < nvec) unpack8(reinterpret_cast<const uint4*>(w)[c], wv[i]);
   }
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+  uint4 nx[VEC], ng[VEC];
+  auto fetch = [&](int row) {
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) {
+      int c = threadIdx.x + i * THREADS;
+      if (c < nvec && row < rows) {
+        nx[i] = reinterpret_cast<const uint4*>(x + (size_t)row * H)[c];
+        ng[i] = reinterpret_cast<const uint4*>(dy + (size_t)row * H)[c];
+      }
+    }
+  };
+  int row = blockIdx.x;
+  fetch(row);
+  for (; row < rows; row += gridDim.x) {
     const float r = rstd[row];
-    float xh[MAX_VEC][8], gw[MAX_VEC][8];
+    float xh[VEC][8], gw[VEC][8];
     float dot = 0.f;
 #pragma unroll
-    for (int i = 0; i < MAX_VEC; ++i) {
+    for (int i = 0; i < VEC; ++i) {
       int c = threadIdx.x + i * THREADS;
       if (c < nvec) {
         float g[8];
-        unpack8(reinterpret_cast<const uint4*>(x + (size_t)row * H)[c], xh[i]);
-        unpack8(reinterpret_cast<const uint4*>(dy + (size_t)row * H)[c], g);
+        unpack8(nx[i], xh[i]);
+        unpack8(ng[i], g);
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
           xh[i][k] *= r;
@@ -93,9 +109,10 @@ rmsnorm_bwd_kernel(const bf16* __restrict__ dy, const bf16* __restrict__ x, cons
         }
       }
     }
+    fetch(row + gridDim.x);  // in flight during the reduction below
     dot = block_sum(dot, red) / H;
 #pragma unroll
-    for (int i = 0; i < MAX_VEC; ++i) {
+    for (int i = 0; i < VEC; ++i) {
       int c = threadIdx.x + i * THREADS;
       if (c < nvec) {
         float o[8];
@@ -111,13 +128,23 @@ rmsnorm_bwd_kernel(const bf16* __restrict__ dy, const bf16* __restrict__ x, cons
       }
     }
   }
+  float* part = dw_part + (size_t)blockIdx.x * H;
 #pragma unroll
-  for (int i = 0; i < MAX_VEC; ++i) {
+  for (int i = 0; i < VEC; ++i) {
     int c = threadIdx.x + i * THREADS;
-    if (c < nvec)
-#pragma unroll
-      for (int k = 0; k < 8; ++k) atomicAdd(dw + c * 8 + k, dwacc[i][k]);
+    if (c < nvec) {
+      reinterpret_cast<float4*>(part + c * 8)[0] = make_float4(dwacc[i][0], dwacc[i][1], dwacc[i][2], dwacc[i][3]);
+      reinterpret_cast<float4*>(part + c * 8)[1] = make_float4(dwacc[i][4], dwacc[i][5], dwacc[i][6], dwacc[i][7]);
+    }
   }
+}
+
+__global__ void rmsnorm_dw_reduce_kernel(const float* __restrict__ part, float* __restrict__ dw, int nparts, int H) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= H) return;
+  float s = 0.f;
+  for (int b = 0; b < nparts; ++b) s += part[(size_t)b * H + c];
+  dw[c] = s;
 }
 
 }  // namespace
@@ -128,11 +155,17 @@ void rmsnorm_fwd(const bf16* x, const bf16* res, const bf16* w, bf16* y, bf16* s
   rmsnorm_fwd_kernel<<<rows, THREADS, 0, st>>>(x, res, w, y, s_out, rstd, H, eps);
 }
 
+int rmsnorm_bwd_parts(int rows, int num_sms) { return rows < num_sms * 2 ? rows : num_sms * 2; }
+
 void rmsnorm_bwd(const bf16* dy, const bf16* x, const bf16* w, const float* rstd, const bf16* dres_in, bf16* dx,
-                 float* dw, int rows, int H, int num_sms, cudaStream_t st) {
+                 float* dw, float* dw_part, int rows, int H, int num_sms, cudaStream_t st) {
   if (rows == 0) return;
-  int grid = min(rows, num_sms * 4);
-  rmsnorm_bwd_kernel<<<grid, THREADS, 0, st>>>(dy, x, w, rstd, dres_in, dx, dw, rows, H);
+  const int vec = (H / 8 + THREADS - 1) / THREADS;
+  const int grid = rmsnorm_bwd_parts(rows, num_sms);
+  if (vec <= 1) rmsnorm_bwd_kernel<1><<<grid, THREADS, 0, st>>>(dy, x, w, rstd, dres_in, dx, dw_part, rows, H);
+  else if (vec == 2) rmsnorm_bwd_kernel<2><<<grid, THREADS, 0, st>>>(dy, x, w, rstd, dres_in, dx, dw_part, rows, H);
+  else rmsnorm_bwd_kernel<4><<<grid, THREADS, 0, st>>>(dy, x, w, rstd, dres_in, dx, dw_part, rows, H);
+  rmsnorm_dw_reduce_kernel<<<(H + 255) / 256, 256, 0, st>>>(dw_part, dw, grid, H);
 }
 
 }  // namespace qk

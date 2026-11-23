@@ -24,8 +24,9 @@ void gemm_force_config(int cfg);  // -1 heuristic, 0 = 128x128, 1 = 128x256 (ben
 
 void rmsnorm_fwd(const bf16* x, const bf16* res, const bf16* w, bf16* y, bf16* s_out, float* rstd, int rows, int H,
                  float eps, cudaStream_t st);
+int rmsnorm_bwd_parts(int rows, int num_sms);  // size of dw_part's first dim
 void rmsnorm_bwd(const bf16* dy, const bf16* x, const bf16* w, const float* rstd, const bf16* dres_in, bf16* dx,
-                 float* dw, int rows, int H, int num_sms, cudaStream_t st);
+                 float* dw, float* dw_part, int rows, int H, int num_sms, cudaStream_t st);
 
 void qk_norm_rope_fwd(const bf16* qkv, const int* pos, const bf16* wq, const bf16* wk, bf16* q, bf16* k, bf16* v,
                       float* rstd_q, float* rstd_k, int B, int S, int Hq, int Hkv, int kv_S, int kv_off, float theta,
