@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #define MK_THREADS 512
+#define MK_MAX_SPLIT 32
 
 namespace mk {
 using bf16 = __nv_bfloat16;
@@ -34,7 +35,7 @@ struct MegaParams {
   bf16* attn_out;         // [B, Hq * D]
   bf16* h;                // [B, I]
   float* logits;          // [B, V]
-  unsigned* bar;          // grid barrier counter (zeroed before launch)
+  unsigned* bar;          // [counter_words(n_layers)]: grid barrier + per-stage row counters (zeroed per launch)
   unsigned long long* timing;  // optional: block 0 writes %globaltimer at each stage boundary
   int prefetch;           // bit0: L2-prefetch O-proj slice during attention; bit1: next-stage rows before barriers.
                           // Measured slower on A100 (L2 contention with the streaming GEMVs); off by default.
@@ -42,4 +43,5 @@ struct MegaParams {
 
 cudaError_t launch(const MegaParams& p, int grid, cudaStream_t st);
 int max_grid(int B, int num_sms);
+size_t counter_words(int n_layers);
 }  // namespace mk

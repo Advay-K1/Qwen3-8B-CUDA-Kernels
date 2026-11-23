@@ -14,6 +14,7 @@ class MegaDecoder:
 
     def __init__(self, model, B, Smax, k_cache, v_cache, layers=None, with_head=True, prefetch=0):
         self.prefetch = prefetch
+        self.min_chunk = 128  # keys per attention split, at least (fewer splits = cheaper combine)
         self.timing = None  # set to an int64 CUDA tensor (>= 8 + 6*n_layers) to profile stages
         m = mega()
         c = model.cfg
@@ -33,21 +34,21 @@ class MegaDecoder:
         sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self.grid = min(sms, m.max_grid(B))
         assert self.grid > 0, "megakernel does not fit on this GPU"
-        self.max_split = max(1, self.grid // (B * c.n_kv_heads))
+        self.max_split = max(1, min(32, self.grid // (B * c.n_kv_heads)))
         bf = dict(device=dev, dtype=torch.bfloat16)
         f32 = dict(device=dev, dtype=torch.float32)
         self.x = torch.empty(B, c.hidden, **bf)
         self.qkv = torch.empty(B, c.qkv_dim, **bf)
-        self.part = torch.empty(B, c.n_heads, self.max_split, 130, **f32)
+        self.part = torch.empty(B, c.n_heads, self.max_split, 132, **f32)
         self.attn = torch.empty(B, c.n_heads * c.head_dim, **bf)
         self.h = torch.empty(B, c.intermediate, **bf)
         self.logits = torch.empty(B, c.vocab if self.lm_head is not None else 1, **f32)
-        self.bar = torch.zeros(1, device=dev, dtype=torch.int32)
+        self.bar = torch.zeros(1 + 8 * (self.n_layers + 1), device=dev, dtype=torch.int32)
         self._dummy = torch.zeros(8, **bf)
 
     def _schedule(self, pos):
         L = pos + 1
-        nsplit = max(1, min(self.max_split, math.ceil(L / 32)))
+        nsplit = max(1, min(self.max_split, math.ceil(L / self.min_chunk)))
         chunk = math.ceil(L / nsplit)
         nsplit = math.ceil(L / chunk)
         return nsplit, chunk

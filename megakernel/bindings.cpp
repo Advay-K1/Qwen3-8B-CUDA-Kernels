@@ -67,7 +67,9 @@ void decode_step(const Tensor& layers, int64_t n_layers, const c10::optional<Ten
   p.timing = timing.has_value() ? reinterpret_cast<unsigned long long*>(timing->data_ptr<int64_t>()) : nullptr;
   p.bar = reinterpret_cast<unsigned*>(bar.data_ptr<int32_t>());
   auto st = at::cuda::getCurrentCUDAStream();
-  cudaMemsetAsync(p.bar, 0, sizeof(unsigned), st);
+  TORCH_CHECK((size_t)bar.numel() >= mk::counter_words(n_layers), "bar buffer too small");
+  TORCH_CHECK(nsplit <= MK_MAX_SPLIT, "nsplit too large");
+  cudaMemsetAsync(p.bar, 0, mk::counter_words(n_layers) * sizeof(unsigned), st);
   auto err = mk::launch(p, grid, st);
   TORCH_CHECK(err == cudaSuccess, "megakernel launch failed: ", cudaGetErrorString(err));
 }
