@@ -147,14 +147,15 @@ def hf_reference(n_new):
     with torch.no_grad():
         logits = ref(input_ids=ids).logits.float()
         gen = ref.generate(ids, max_new_tokens=n_new, do_sample=False, temperature=None, top_p=None, top_k=None)
+        gen_logits = ref(input_ids=gen).logits.float()[0]  # teacher-forced logits along HF's own sequence
     del ref
     gc.collect()
     torch.cuda.empty_cache()
-    return tok, ids, logits, gen
+    return tok, ids, logits, gen, gen_logits
 
 
 def test_full_model(n_new=32):
-    tok, ids, logits_r, gen_r = hf_reference(n_new)
+    tok, ids, logits_r, gen_r, gen_logits = hf_reference(n_new)
     m = Qwen3Model.from_pretrained(PATH)
     with torch.no_grad():
         logits_o = m(ids).float()
@@ -168,8 +169,14 @@ def test_full_model(n_new=32):
         same = (gen_o[0, :n] == gen_r[0, :n])
         first_diff = int((~same).nonzero()[0].item()) if (~same).any() else n
         n_match = first_diff - ids.shape[1]
-        report(f"greedy generate ({name}) vs HF", n_match >= min(16, n_new),
-               f"{n_match}/{n_new} tokens identical before first divergence")
+        if first_diff < n:
+            # A divergence is acceptable only at a bf16 near-tie in HF's own logits.
+            lg = gen_logits[first_diff - 1]
+            gap = abs(lg[gen_r[0, first_diff]] - lg[gen_o[0, first_diff]]).item()
+            ok, why = gap <= 0.25, f"diverges at a near-tie (HF logit gap {gap:.3f})"
+        else:
+            ok, why = True, "identical"
+        report(f"greedy generate ({name}) vs HF", ok, f"{n_match}/{n_new} tokens identical; {why}")
         print("   ours:", repr(tok.decode(gen_o[0, ids.shape[1]:])))
     print("   hf  :", repr(tok.decode(gen_r[0, ids.shape[1]:])))
 
