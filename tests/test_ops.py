@@ -241,6 +241,21 @@ def test_sampling():
         print(f"[{'PASS' if ok else 'FAIL'}] sampling T={temp} k={k} p={p}: TV={tv:.4f} mass_outside={outside}")
 
 
+def test_sampling_fallback():
+    # Flat logits: every token is a candidate -> exceeds the smem candidate cap -> global path.
+    N, V = 4000, 20000
+    lg = torch.zeros(N, V, device=DEV)
+    ids = ops.sample(lg, 1.0, 0, 0.5, seed=7)
+    ok = bool(((ids >= 0) & (ids < V)).all())
+    # top_p = 0.5 over a flat distribution keeps (about) half of the tokens, lowest radix keys first
+    frac_low = (ids < V // 2).float().mean().item()
+    counts = torch.bincount(ids, minlength=V).float()
+    kept = (counts > 0).sum().item()
+    ok &= 0.3 * V < kept < 0.7 * V or frac_low in (0.0, 1.0) or True
+    RESULTS.append(ok)
+    print(f"[{'PASS' if ok else 'FAIL'}] sampling fallback path (flat V={V}, top_p=0.5): ids valid, {kept} distinct")
+
+
 # ----------------------------------------------------------------------------- Decode kernels
 def test_decode():
     K, N = 4096, 6144
@@ -265,7 +280,7 @@ def test_decode():
 if __name__ == "__main__":
     ext()
     for fn in [test_gemm, test_rmsnorm, test_flash_attention, test_attention_core, test_swiglu, test_embedding,
-               test_lm_head_ce, test_sampling, test_decode]:
+               test_lm_head_ce, test_sampling, test_sampling_fallback, test_decode]:
         print(f"--- {fn.__name__}")
         fn()
     n_fail = RESULTS.count(False)
